@@ -525,7 +525,7 @@ def parse_instinct_file(content: str) -> list[dict]:
     in_frontmatter = False
     content_lines = []
 
-    for line in content.split('\n'):
+    for line in content.removeprefix('\ufeff').split('\n'):
         if line.strip() == '---':
             if in_frontmatter:
                 # End of frontmatter - content comes next
@@ -551,7 +551,8 @@ def parse_instinct_file(content: str) -> list[dict]:
                     value = value[1:-1].replace("''", "'")
                 if key == 'confidence':
                     try:
-                        current[key] = float(value)
+                        confidence = float(value)
+                        current[key] = confidence if 0.0 <= confidence <= 1.0 else 0.5
                     except ValueError:
                         current[key] = 0.5  # default on malformed confidence
                 else:
@@ -1934,6 +1935,24 @@ def _cmd_projects_merge(args) -> int:
 # Generate Evolved Structures
 # ─────────────────────────────────────────────
 
+def _evolved_description(trigger: str, instincts: list, kind: str) -> str:
+    """Build the frontmatter `description` for a generated artifact.
+
+    Claude Code (and every spec-compliant Agent Skills client) injects only
+    `name` + `description` at startup and will not load an artifact that lacks
+    them, so a generated skill/agent without frontmatter is inert on disk.
+    """
+    ids = ', '.join(i.get('id', 'unnamed') for i in instincts[:6])
+    trig = (trigger or '').strip().rstrip('.') or 'a recurring situation'
+    description = (
+        f"Evolved {kind} covering {len(instincts)} learned instinct(s). "
+        f"Use {trig}. Source instincts - {ids}."
+    )
+    # `: ` breaks strict YAML parsers in an unquoted scalar; `<`/`>` can inject
+    # into the system prompt.
+    return description.replace(': ', ' - ').replace('<', '(').replace('>', ')')
+
+
 def _generate_evolved(skill_candidates: list, workflow_instincts: list, agent_candidates: list, evolved_dir: Path, limit: int = 0) -> list[str]:
     """Generate skill/command/agent files from analyzed instinct clusters.
 
@@ -1966,7 +1985,11 @@ def _generate_evolved(skill_candidates: list, workflow_instincts: list, agent_ca
         skill_dir = evolved_dir / "skills" / name
         skill_dir.mkdir(parents=True, exist_ok=True)
 
-        content = f"# {name}\n\n"
+        content = "---\n"
+        content += f"name: {name}\n"
+        content += f"description: {_yaml_quote(_evolved_description(trigger, cand['instincts'], 'skill'))}\n"
+        content += "---\n\n"
+        content += f"# {name}\n\n"
         content += f"Evolved from {len(cand['instincts'])} instincts "
         content += f"(avg confidence: {cand['avg_confidence']:.0%})\n\n"
         content += f"## When to Apply\n\n"
@@ -1993,7 +2016,10 @@ def _generate_evolved(skill_candidates: list, workflow_instincts: list, agent_ca
             continue
 
         cmd_file = evolved_dir / "commands" / f"{cmd_name}.md"
-        content = f"# {cmd_name}\n\n"
+        content = "---\n"
+        content += f"description: {_yaml_quote(_evolved_description(inst.get('trigger', ''), [inst], 'command'))}\n"
+        content += "---\n\n"
+        content += f"# {cmd_name}\n\n"
         content += f"Evolved from instinct: {inst.get('id', 'unnamed')}\n"
         content += f"Confidence: {inst.get('confidence', 0.5):.0%}\n\n"
         content += inst.get('content', '')
@@ -2016,7 +2042,10 @@ def _generate_evolved(skill_candidates: list, workflow_instincts: list, agent_ca
         domains = ', '.join(cand['domains'])
         instinct_ids = [i.get('id', 'unnamed') for i in cand['instincts']]
 
-        content = f"---\nmodel: sonnet\ntools: Read, Grep, Glob\n---\n"
+        content = "---\n"
+        content += f"name: {agent_name}\n"
+        content += f"description: {_yaml_quote(_evolved_description(str(cand.get('trigger', '')), cand['instincts'], 'agent'))}\n"
+        content += "model: sonnet\ntools: Read, Grep, Glob\n---\n"
         content += f"# {agent_name}\n\n"
         content += f"Evolved from {len(cand['instincts'])} instincts "
         content += f"(avg confidence: {cand['avg_confidence']:.0%})\n"

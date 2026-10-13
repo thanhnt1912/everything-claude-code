@@ -18,12 +18,15 @@ const {
   DEFAULT_CONTEXT_THRESHOLD_STANDARD,
   DEFAULT_CONTEXT_THRESHOLD_LARGE,
   DEFAULT_CONTEXT_INTERVAL_TOKENS,
+  DEFAULT_TRANSCRIPT_TAIL_BYTES,
+  readFileTail,
   readLatestContextTokens,
   resolveContextWindowTokens,
   resolveContextThreshold,
   resolveContextInterval,
   computeContextBucket,
-  formatWindowLabel
+  formatWindowLabel,
+  isContextWindowInferred
 } = require('../../scripts/lib/transcript-context');
 
 console.log('=== Testing transcript-context.js ===\n');
@@ -42,12 +45,14 @@ function test(desc, fn) {
   }
 }
 
+const transcriptRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-transcript-context-'));
+process.on('exit', () => fs.rmSync(transcriptRoot, { recursive: true, force: true }));
 let fixtureSeq = 0;
 
 function writeTranscript(lines) {
   fixtureSeq += 1;
-  const filePath = path.join(os.tmpdir(), `transcript-context-test-${process.pid}-${fixtureSeq}.jsonl`);
-  fs.writeFileSync(filePath, lines.join('\n') + '\n');
+  const filePath = path.join(transcriptRoot, `transcript-context-test-${process.pid}-${fixtureSeq}.jsonl`);
+  fs.writeFileSync(filePath, lines.join('\n') + '\n', { flag: 'wx', mode: 0o600 });
   return filePath;
 }
 
@@ -108,7 +113,7 @@ test('returns null for a transcript with no usage records', () => {
 });
 
 test('returns null for a missing transcript file', () => {
-  assert.strictEqual(readLatestContextTokens(path.join(os.tmpdir(), 'definitely-missing.jsonl')), null);
+  assert.strictEqual(readLatestContextTokens(path.join(transcriptRoot, 'definitely-missing.jsonl')), null);
 });
 
 test('returns null for empty or non-string paths', () => {
@@ -138,6 +143,10 @@ console.log('\nresolveContextWindowTokens:');
 
 // Isolation: an env-set window override (either knob) otherwise leaks into the
 // default-window assertions below and fails them (#2290).
+const originalContextWindowEnv = {
+  ECC_CONTEXT_WINDOW_TOKENS: process.env.ECC_CONTEXT_WINDOW_TOKENS,
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW: process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW,
+};
 delete process.env.ECC_CONTEXT_WINDOW_TOKENS;
 delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
 
@@ -218,6 +227,39 @@ test('treats an empty model id as standard window', () => {
   assert.strictEqual(resolveContextWindowTokens(100000, ''), STANDARD_CONTEXT_WINDOW_TOKENS);
 });
 
+// ── isContextWindowInferred ──
+console.log('\nisContextWindowInferred:');
+
+test('flags the assumed 200k default as inferred', () => {
+  assert.strictEqual(isContextWindowInferred(187000, 'claude-opus-9'), true);
+});
+
+test('an env override is a detected window, not inferred', () => {
+  process.env.ECC_CONTEXT_WINDOW_TOKENS = '1000000';
+  try {
+    assert.strictEqual(isContextWindowInferred(187000, 'claude-opus-9'), false);
+  } finally {
+    delete process.env.ECC_CONTEXT_WINDOW_TOKENS;
+  }
+});
+
+test('a [1m] marker is a detected window, not inferred', () => {
+  assert.strictEqual(isContextWindowInferred(187000, 'claude-opus-4-5[1m]'), false);
+});
+
+test('a known large-window family is a detected window, not inferred', () => {
+  assert.strictEqual(isContextWindowInferred(187000, 'claude-fable-5'), false);
+});
+
+test('tokens above the standard window still leave the exact size inferred', () => {
+  assert.strictEqual(isContextWindowInferred(220000, 'claude-opus-9'), true);
+});
+
+for (const [name, value] of Object.entries(originalContextWindowEnv)) {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
 // ── resolveContextThreshold ──
 console.log('\nresolveContextThreshold:');
 
@@ -283,6 +325,20 @@ test('returns -1 when the threshold is disabled (0)', () => {
 
 test('returns -1 for non-finite token counts', () => {
   assert.strictEqual(computeContextBucket(NaN, 160000, 60000), -1);
+});
+
+// ── readFileTail ──
+console.log('\nreadFileTail:');
+
+test('is exported and returns the trailing bytes with a truncation flag', () => {
+  assert.strictEqual(typeof readFileTail, 'function');
+  assert.strictEqual(DEFAULT_TRANSCRIPT_TAIL_BYTES, 256 * 1024);
+  const file = tracked(writeTranscript(['first-line', 'second', 'third']));
+  const whole = readFileTail(file, 1024);
+  assert.deepStrictEqual(whole, { text: 'first-line\nsecond\nthird\n', truncated: false });
+  const tail = readFileTail(file, 6);
+  assert.deepStrictEqual(tail, { text: 'third\n', truncated: true });
+  assert.strictEqual(readFileTail(path.join(transcriptRoot, `missing-${process.pid}.jsonl`), 10), null);
 });
 
 // ── formatWindowLabel ──
